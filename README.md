@@ -69,7 +69,7 @@ URL above, then search for "AMS Graphic Card" in the store.
      ams-ht/base.png
    (AMS-3H is vector, no assets required)
 3. Settings → Dashboards → Resources → add
-     /local/ams2pro-card.js?v=1.28    (JavaScript module)
+     /local/ams2pro-card.js?v=1.30    (JavaScript module)
 ```
 
 Asset paths are derived from the directory of the card file itself, so a store install

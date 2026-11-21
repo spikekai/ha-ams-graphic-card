@@ -68,7 +68,7 @@
      ams-ht/   （base.png）
    AMS-3H 为矢量绘制，不需要素材
 3. 设置 → 仪表盘 → 资源 → 添加
-     /local/ams2pro-card.js?v=1.28    （JavaScript 模块）
+     /local/ams2pro-card.js?v=1.30    （JavaScript 模块）
 ```
 
 素材路径按卡片文件自身所在目录推导，商店安装与手动安装的目录结构一致。

@@ -89,7 +89,7 @@
  *        使同一个包在 /local/ 或 HACS 的 /hacsfiles/<repo>/ 下都能直接工作）
  * ==============================================================
  */
-const AMS2PRO_VERSION = '1.28';
+const AMS2PRO_VERSION = '1.30';
 const A2P_MESSAGES = {
   "idle": {
     "zh": "待机",
@@ -442,6 +442,8 @@ function assetDir(geo) {
 const LABEL_FONT = 20;   // 材料标签
 const PCT_FONT = 21;     // 余量百分比（用户要求放大 1.5 倍：14 → 21）
 const EMPTY_LABEL = 'empty';   // 空盘位标签文字（仅在 show_empty_label 开启时绘制）
+// 系统开启「减少动态效果」时不加旋转动画（与其它动画的 prefers-reduced-motion 处理一致）
+const A2P_REDUCED = typeof matchMedia === 'function' && matchMedia('(prefers-reduced-motion: reduce)').matches;
 
 const _mcv = document.createElement('canvas');
 const _mctx = _mcv.getContext('2d');
@@ -524,30 +526,27 @@ const ams3hTrue = v => v === true || v === 'true';
     const offline = !ams3hAvailable(state);
     const empty = !offline && (ams3hTrue(a.unknown) || ams3hTrue(a.empty) || a.type === 'Empty' || String(a.color).toUpperCase() === '#00000000');
     const remain = a.remain == null ? -1 : Number(a.remain);
+    const pct = Number.isFinite(remain) && remain >= 0 ? `${Math.min(100, remain)}%` : '';
     const amount = !Number.isFinite(remain) || remain < 0 ? 95 : 20 + Math.max(0, Math.min(100, remain)) * 0.75;
-    return { entity, number, offline, empty, amount, name: a.name || a.type || '',
+    return { entity, number, offline, empty, amount, pct, name: a.name || a.type || '',
       material: offline ? a2pText(hass, "offline") : empty ? a2pText(hass, "emptySlot") : a.type || a2pText(hass, "unknownMaterial"),
       color: ams3hValidColor(a.color) ? a.color : '#888888',
       colors: Array.isArray(a.cols) ? a.cols.filter(ams3hValidColor).slice(0, 8) : [],
       remaining: Number.isFinite(remain) && remain >= 0 ? `${Math.min(100, remain)}%` : a2pText(hass, "unknownRemaining") };
   }
-  // 按实体 ID、一基槽号、tray_N、slot 或唯一且非零的 tray_uuid 匹配。
-  // 不按颜色/耗材名匹配，不借用各槽 active 标记，避免多个工具同时高亮。
-  function ams3hActiveNumber(state, cfg) {
-    if (!ams3hAvailable(state) || ['none', '', '?'].includes(String(state.state).toLowerCase())) return 0;
-    const value = String(state.state);
-    const entityIndex = cfg.trays.indexOf(value);
-    if (entityIndex >= 0) return entityIndex + 1;
-    const match = value.match(/^(?:tray_)?([1-9])$/);
-    if (match) return Number(match[1]);
-    const slot = Number(state.attributes?.slot);
-    if (Number.isInteger(slot) && slot >= 1 && slot <= 9) return slot;
-    // HA 的 active_tray.state 可能是材料名；用料卷身份匹配，不能按颜色/名字猜。
-    const uuid = String(state.attributes?.tray_uuid || '').replace(/-/g,'').toLowerCase();
-    if (!/^[0-9a-f]{32}$/.test(uuid) || /^0+$/.test(uuid)) return 0;
-    const matches = cfg.trays.map((id,i) => ({i, state:cfg.states?.[id]})).filter(t =>
-      ams3hAvailable(t.state) && String(t.state.attributes?.tray_uuid || '').replace(/-/g,'').toLowerCase() === uuid);
-    return matches.length === 1 ? matches[0].i + 1 : 0;
+  // 高亮以「已安装到位的喷嘴」为准：printtool_N 的 state 为 mounted（热端架 mounted_slot_id）。
+  // 托盘的 active 只表示该槽正在进料，与「当前是哪个工具头在工作」不是同一个概念，
+  // 仅在没有热端架实体（无 printtool_N）的机型上作为回退。
+  // 多个 mounted 时取编号最小者，保证结果确定。
+  function ams3hActiveFromTools(cfg, states) {
+    const mounted = cfg.tools
+      .map((id, i) => ({ i, state: id ? states[id] : null }))
+      .filter((t) => ams3hAvailable(t.state) && String(t.state.state).toLowerCase() === 'mounted');
+    if (mounted.length) return mounted[0].i + 1;
+    const flagged = cfg.trays
+      .map((id, i) => ({ i, state: states?.[id] }))
+      .filter((t) => ams3hAvailable(t.state) && (t.state.attributes?.active || t.state.attributes?.in_use));
+    return flagged.length ? flagged[0].i + 1 : 0;
   }
   const ams3hText = (x, y, value, size = 24, attrs = '') => `<text x="${x}" y="${y}" font-size="${size}" ${attrs}>${esc(value)}</text>`;
 
@@ -616,14 +615,12 @@ class Ams2ProCard extends HTMLElement {
 
   connectedCallback() {
     this._update();
-    if (!this._zoneResizeObserver) this._zoneResizeObserver = new ResizeObserver(() => {
-      if (this._variantKey === 'ams3h') this._fitAms3hZones();
-    });
-    this._zoneResizeObserver.observe(this);
+    /* 温湿度行不再依赖容器尺寸重算：尺寸固定，居中在每次渲染后一次算定。 */
   }
 
   disconnectedCallback() {
     this._zoneResizeObserver?.disconnect();
+    this._zoneResizeObserver = null;
   }
 
   static async getConfigElement() {
@@ -727,10 +724,11 @@ class Ams2ProCard extends HTMLElement {
     this._sig=sig;this._resolved=r;
     const slots=r.trays.map((id,i)=>ams3hSlotData(states[id],id,i+1,this._hass));
     const printing = states[r.printStatusEntity];
-    let active=ams3hAvailable(printing) && ['prepare','running'].includes(printing.state)
-      ? ams3hActiveNumber(states[r.activeEntity],{trays:r.trays,states}) : 0;
-    if(active && (slots[active-1].offline || slots[active-1].empty))active=0;
-    this._renderAms3h(r,slots,active);
+    const activeNumber = ams3hAvailable(printing) && ['prepare','running','pause'].includes(printing.state)
+      ? ams3hActiveFromTools(r, states) : 0;
+    let activeSet = new Set(activeNumber > 0 ? [activeNumber] : []);
+    activeSet = new Set([...activeSet].filter(n => slots[n-1] && !slots[n-1].offline && !slots[n-1].empty));
+    this._renderAms3h(r,slots,activeSet);
   }
   _ams3hDrying(z) {
     const entities = ['temperature','humidity','remaining_drying_time']
@@ -751,10 +749,10 @@ class Ams2ProCard extends HTMLElement {
     // v1.14：以 y=86 为缩放基点，整块放大 40%；九槽几何保持不变。
     const zoneScale = 1.4, zoneX = number === 1 ? 182 : 1117;
     return '<g class="zone" transform="translate('+zoneX+' 86) scale('+zoneScale+') translate('+(-x)+' -86)">'+(isDryingZone ? ams3hText(x + 8 / zoneScale,106,a2pText(this?._hass, "dryingZone"),16,'class="zone-title"') : '')+
-      '<g class="zone-humidity"'+(isDryingZone ? ' data-center="'+(x + 109.08 / zoneScale / 2)+'"' : '')+'>'+Ams2ProCard.humidityIcon(states[z.humidity]?.state, 'x="'+(x+1)+'" y="130" data-x="'+(x+1)+'"')+
-      ams3hText(x+28,150,value('humidity','%'),23)+'</g>'+ams3hText(x,188,value('temperature','°C'),23,'class="zone-temperature"'+(heating ? ' style="fill:var(--a2p-drying-temperature)"' : ''))+(drying ? ams3hText(x,222,drying,17,'class="zone-time"') : '')+'</g>';
+      '<g class="zone-humidity"'+(isDryingZone ? ' data-center="'+(x + 109.08 / zoneScale / 2)+'"' : '')+'>'+Ams2ProCard.humidityIcon(states[z.humidity]?.state, 'x="'+(x+1)+'" y="130"', 24)+
+      ams3hText(x+30,150,value('humidity','%'),23)+'</g>'+ams3hText(x,188,value('temperature','°C'),23,'class="zone-temperature"'+(heating ? ' style="fill:var(--a2p-drying-temperature)"' : ''))+(drying ? ams3hText(x,222,drying,17,'class="zone-time"') : '')+'</g>';
   }
-  _renderAms3h(r,slots,active) {
+  _renderAms3h(r,slots,activeSet) {
     const drying = this._ams3hDrying(r.zones[0]);
     this.shadowRoot.innerHTML = `<style>
       :host{display:block;height:100%;
@@ -770,7 +768,7 @@ class Ams2ProCard extends HTMLElement {
       text{fill:currentColor;pointer-events:none}.slot{color:#ddd;cursor:pointer}.slot-frame{fill:#131313;stroke:var(--a2p-slot-outline);stroke-width:1;vector-effect:non-scaling-stroke}
       .slot-number{fill:#404040;stroke:#777;stroke-width:.6;vector-effect:non-scaling-stroke}
       .dimmed > .slot-frame,.dimmed > .slot-number{opacity:1}
-      .slot.active .slot-frame{stroke:#eee}.dimmed{opacity:1}.dimmed > :not(text):not(.slot-frame):not(.slot-number):not(.drying-indicator):not(.drying-frame):not(.spool),.dimmed.empty > .spool,.dimmed.offline > .spool{opacity:.32}.offline{color:#888}
+      .slot.active .slot-frame{stroke:var(--a2p-text)}.dimmed{opacity:1}.dimmed > :not(text):not(.slot-frame):not(.slot-number):not(.drying-indicator):not(.drying-frame):not(.spool),.dimmed.empty > .spool,.dimmed.offline > .spool{opacity:.32}.offline{color:#888}
       .tube{fill:none;stroke:var(--a2p-secondary);stroke-width:4;stroke-dasharray:8 8}.feed.active .tube{stroke:var(--feed-color);stroke-width:6;stroke-dasharray:none}
       .tool-frame{fill:none;stroke:transparent}.feed.active .tool-frame{stroke:var(--a2p-text);stroke-width:2;vector-effect:non-scaling-stroke}
       .feed.active .tool > path:not(:last-child){stroke:var(--a2p-text);stroke-width:1.5}.tool-filament{fill:none;stroke:var(--feed-color);stroke-width:6;stroke-linecap:round}
@@ -787,8 +785,8 @@ class Ams2ProCard extends HTMLElement {
       <rect x="152" y="64" width="1096" height="532" rx="18" fill="var(--a2p-panel)"/>
       <path d="M152 496H1248V578Q1248 596 1230 596H170Q152 596 152 578Z" fill="none"/>
       ${this._config.show_info_bar !== false ? [r.zones[1],r.zones[0]].map((z,i)=>this._ams3hZone(z,i+1,i ? 1120 : 177)).join('') : ''}
-      ${slots.map(s=>this._ams3hPath(s,s.number===active)).join('')}
-      ${slots.map(s=>this._ams3hSlot(s,s.number===active,!!active,drying.active && drying.slots.has(s.number))).join('')}
+      ${slots.map(s=>this._ams3hPath(s,activeSet.has(s.number))).join('')}
+      ${slots.map(s=>this._ams3hSlot(s,activeSet.has(s.number),activeSet.size>0,drying.active && drying.slots.has(s.number))).join('')}
       </svg><svg class="nozzle-sizes" viewBox="152 0 1096 44" xmlns="http://www.w3.org/2000/svg">
       ${r.tools.map((id,i) => {
         const tool = this._hass.states[id], diameter = Number(tool?.attributes?.nozzle_diameter);
@@ -805,29 +803,29 @@ class Ams2ProCard extends HTMLElement {
     });
   }
 
+  // 温湿度行尺寸固定（图标 24、字号 23，均为缩放坐标系内的值），
+  // 数值变化只影响字距（textLength），不再改字号或图标尺寸，因此不会跳动。
   _fitAms3hZones() {
+    const width = 109.08 / 1.4;          // 区块在缩放坐标系里的可用宽度
+    const iconWidth = 24, gap = 5;
+    const squeeze = (el, available) => {
+      el.removeAttribute('textLength'); el.removeAttribute('lengthAdjust');
+      if (el.getBBox().width > available) {
+        el.setAttribute('textLength', available);
+        el.setAttribute('lengthAdjust', 'spacingAndGlyphs');
+      }
+    };
     this.shadowRoot.querySelectorAll('.zone-humidity').forEach(el => {
       el.removeAttribute('transform');
-      const factor = el.getScreenCTM()?.a;
-      if (!(factor > 0) || !el.getBBox().width) return;
-      const icon = el.querySelector('.humidity-icon'), text = el.querySelector('text');
-      const size = 19 / factor, gap = 4 / factor, x = Number(icon.dataset.x);
-      icon.setAttribute('width', size); icon.setAttribute('height', size);
-      icon.setAttribute('y', 142 - size / 2);
-      text.setAttribute('x', x + size + gap);
-      text.removeAttribute('textLength'); text.removeAttribute('lengthAdjust');
-      text.setAttribute('font-size', 23);
-      const available = Math.max(1, 109.08 / 1.4 - size - gap);
-      if (text.getBBox().width > available) {
-        text.setAttribute('font-size', 23 * available / text.getBBox().width);
+      const text = el.querySelector('text');
+      if (text) squeeze(text, Math.max(1, width - iconWidth - gap));
+      const center = el.dataset.center;
+      if (center) {
+        const box = el.getBBox();
+        el.setAttribute('transform', 'translate(' + (Number(center) - (box.x + box.width / 2)) + ' 0)');
       }
-      const box = el.getBBox();
-      const offset = el.dataset.center ? Number(el.dataset.center)-(box.x+box.width/2) : -5 / factor;
-      el.setAttribute('transform', 'translate('+offset+' 0)');
     });
-    this.shadowRoot.querySelectorAll('.zone-temperature,.zone-time').forEach(el => {
-      if (el.getBBox().width > 109.08/1.4) { el.setAttribute('textLength',109.08/1.4); el.setAttribute('lengthAdjust','spacingAndGlyphs'); }
-    });
+    this.shadowRoot.querySelectorAll('.zone-temperature,.zone-time').forEach(el => squeeze(el, width));
   }
 
     _ams3hSlot(s, active, hasActive, drying) {
@@ -837,6 +835,20 @@ class Ams2ProCard extends HTMLElement {
       const title = `${label} · ${s.material} · ${s.name} · ${s.remaining}${active ? a2pText(this?._hass, "inUse") : ''}`;
       const dryingMark = drying ? `<g class="drying-indicator" role="img" aria-label="${a2pText(this._hass,'dryingStatus')}"><title>${a2pText(this._hass,'dryingStatus')}</title><g transform="translate(${x+49} ${y+13})" fill="none" stroke="var(--a2p-warm)" stroke-width="2.5" stroke-linecap="round"><path d="M3 23C-2 18 8 13 3 8M11 23C6 18 16 13 11 3M19 23C14 18 24 13 19 8"/></g></g><path class="drying-frame" d="M${x-72} ${y+3}H${x+72}A12 12 0 0 1 ${x+84} ${y+15}V${y+180}A12 12 0 0 1 ${x+72} ${y+192}H${x-72}A12 12 0 0 1 ${x-84} ${y+180}V${y+15}A12 12 0 0 1 ${x-72} ${y+3}Z"/>` : '';
       const colors = s.colors.length ? s.colors : [s.color];
+      // 旋转条纹：整圈 360° 匀速转动，用 mask 精确裁到耗材填充带（mask 认描边，
+      // clipPath 只认填充，会导致中间空心处也出现动画）。
+      const bandMask = (s.amount > 0 && !A2P_REDUCED)
+        ? `<mask id="a2p-band-${s.number}" maskUnits="userSpaceOnUse" maskContentUnits="userSpaceOnUse">`
+          + `<circle r="34" fill="none" stroke="#fff" stroke-width="25" pathLength="100" stroke-dasharray="${s.amount} ${100 - s.amount}" transform="rotate(-90)"/></mask>`
+        : '';
+      // 沿圆周方向的光带：几段同起点的圆弧叠出「头亮尾淡」的光圈，整组匀速旋转。
+      const ringLight = ['17 83', '11 89', '6 94', '2 98']
+        .map((dash, i) => `<circle r="34" fill="none" stroke="#ffffff" stroke-width="25" pathLength="100"`
+          + ` stroke-dasharray="${dash}" stroke-opacity="${['.08', '.10', '.14', '.18'][i]}"/>`).join('');
+      const spin = (active && bandMask)
+        ? `${bandMask}<g mask="url(#a2p-band-${s.number})" style="pointer-events:none"><g>${ringLight}`
+          + `<animateTransform attributeName="transform" type="rotate" from="0" to="360" dur="12s" repeatCount="indefinite"/></g></g>`
+        : '';
       const segments = colors.map((c, i) => `<circle cx="0" cy="0" r="34" fill="none" stroke="${esc(c)}" stroke-width="25" pathLength="100" stroke-dasharray="${s.amount / colors.length} ${100 - s.amount / colors.length}" stroke-dashoffset="${-i * s.amount / colors.length}" transform="rotate(-90)"/>`).join('');
       return `<g class="${cls}" data-slot="${s.number}" data-entity="${esc(s.entity)}" role="button" tabindex="0" aria-label="${esc(title)}"><title>${esc(title)}</title>
         <rect class="slot-frame" x="${x - 87}" y="${y}" width="174" height="195" rx="15"/>${dryingMark}
@@ -844,7 +856,7 @@ class Ams2ProCard extends HTMLElement {
         ${ams3hText(x - 63, y + 34, label, 25, s.external ? '' : 'text-anchor="middle"')}
         <g transform="translate(${x} ${y + 93})" class="spool">
           ${s.empty || s.offline ? `<circle r="51" fill="#1e1e1e" stroke="#555" stroke-width="2" stroke-dasharray="4 4"/>${ams3hText(0, 9, s.offline ? '—' : '/', 26, 'text-anchor="middle" fill="#888"')}` :
-            `<circle r="51" fill="#282828" stroke="#686868" stroke-width="3"/>${segments}<circle r="46" fill="url(#spool-shade)"/><circle r="20" fill="#131313" stroke="#555" stroke-width="4"/><path d="M35 0h9" stroke="#888" stroke-opacity=".5" stroke-width="6" stroke-linecap="round"/>`}
+            `<circle r="51" fill="#282828" stroke="#686868" stroke-width="3"/>${segments}<circle r="46" fill="url(#spool-shade)"/><circle r="20" fill="#131313" stroke="#555" stroke-width="4"/>${s.pct ? ams3hText(0, 7, s.pct, 18, 'text-anchor="middle" fill="#e8e8e8"') : ''}<path d="M35 0h9" stroke="#888" stroke-opacity=".5" stroke-width="6" stroke-linecap="round"/>${spin}`}
         </g>${(this._config.show_labels !== false && (!s.empty || this._config.show_empty_label)) ? ams3hText(x, y + 174, s.material.length > 13 ? s.material.slice(0, 12) + '…' : s.material, 25, 'text-anchor="middle"') : ''}</g>`;
     }
     _ams3hPath(s, active) {
@@ -1151,9 +1163,9 @@ class Ams2ProCard extends HTMLElement {
     + '<path d="M12.05 10.4v5.2" stroke="#e53935" stroke-width="1.05" stroke-linecap="round"/>'
     + '<path d="M15.1 7.4h1.7M15.1 10h1.1M15.1 12.6h1.7" stroke="#e53935" stroke-width="1.1" stroke-linecap="round"/>'
     + '</svg>';
-  static humidityIcon(state, attrs = '') {
+  static humidityIcon(state, attrs = '', size = 19) {
     const solid = state !== '' && Number.isFinite(Number(state)) && Number(state) > 20;
-    return '<svg class="ic humidity-icon" viewBox="0 0 24 24" width="19" height="19" aria-hidden="true" '+attrs+'>'
+    return '<svg class="ic humidity-icon" viewBox="0 0 24 24" width="'+size+'" height="'+size+'" aria-hidden="true" '+attrs+'>'
       + '<path d="M12 3.3c3.3 4.4 6.2 7.6 6.2 10.8a6.2 6.2 0 1 1-12.4 0C5.8 10.9 8.7 7.7 12 3.3Z" fill="'+(solid ? '#2196f3' : 'none')+'" stroke="#2196f3" stroke-width="1.5" stroke-linejoin="round"/>'
       + '</svg>';
   }
